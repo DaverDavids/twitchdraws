@@ -11,6 +11,7 @@ RANDOMIZE_INTERVAL_SECONDS = 3600    # default: 1 hour
 RANDOMIZE_PERCENT = 0                # default changed to 1% of pixels
 verbose = "--verbose" in sys.argv
 shutdown_event = threading.Event()
+_last_backup_hash = None
 
 ERROR_LOG = "error.log"
 
@@ -61,6 +62,41 @@ def bitmap_snapshot():
     except Exception:
         return {"bitmap_available": False}
         
+def run_test_color_mode(hex_color_input):
+    try:
+        hex_color = clean_hex(hex_color_input)
+    except ValueError as e:
+        log_print(str(e))
+        return
+
+    log_print(f"Test color feature triggered: backing up, then setting display to #{hex_color} for 10s")
+
+    backup_bitmap_now(force=True)
+    snapshot = bitmap.copy()
+
+    payload = {"seg": [{"i": [0, PIXEL_COUNT, hex_color]}]}
+    try:
+        safe_post(f"{BASE_URL}/json/state", json_payload=payload)
+        for i in range(PIXEL_COUNT):
+            bitmap[i] = hex_color
+        log_print(f"Display set to #{hex_color} for 10 seconds.")
+    except Exception as e:
+        log_error("Failed to set test color on display", exc=e)
+        return
+
+    for _ in range(10):
+        if shutdown_event.is_set():
+            return
+        time.sleep(1)
+
+    for i in range(PIXEL_COUNT):
+        bitmap[i] = snapshot[i]
+    try:
+        send_bitmap_fast()
+        log_print("Display reverted to previous state after test color.")
+    except Exception as e:
+        log_error("Failed to revert display after test color", exc=e)
+
 def run_test_mode(interval_sec, num_pixels):
     """
     Independent test loop that updates a specific number of random pixels
@@ -429,22 +465,23 @@ bitmap = load_bitmap()
 
 import hashlib
 
+def backup_bitmap_now(force=False):
+    global _last_backup_hash
+    try:
+        current_hash = hashlib.md5(json.dumps(bitmap).encode()).hexdigest()
+        if force or current_hash != _last_backup_hash:
+            with open(BITMAP_FILE, "w") as f:
+                json.dump(bitmap, f)
+            _last_backup_hash = current_hash
+            if verbose:
+                log_print("Bitmap backed up to backup.json")
+    except Exception as e:
+        log_error("Failed to save bitmap (backup_bitmap_now)", exc=e)
+
 def save_bitmap_periodically():
-    last_hash = None
     backup_interval = config.get('backup_interval_seconds', 300)
     while not shutdown_event.is_set():
-        try:
-            current_hash = hashlib.md5(json.dumps(bitmap).encode()).hexdigest()
-            if current_hash != last_hash:
-                with open(BITMAP_FILE, "w") as f:
-                    json.dump(bitmap, f)
-                last_hash = current_hash
-                if verbose:
-                    log_print("Bitmap changed – backed up to backup.json")
-            elif verbose:
-                log_print("Bitmap unchanged – no backup needed")
-        except Exception as e:
-            log_error("Failed to save bitmap", exc=e)
+        backup_bitmap_now(force=False)
         time.sleep(backup_interval)
 
 def xy_to_index(x, y):
@@ -562,7 +599,8 @@ def print_help():
     log_print("  load <name>            - Load bitmap from bitmaps/<name>.json")
     log_print("  list                   - List all saved bitmaps in the bitmaps/ directory")
     log_print("  reset                  - Re-activate preset, clear, and restore backup.json")
-    log_print("  test <seconds> <pixels> - Send random <pixels> every <seconds>")
+    log_print("  test <hexcolor>          - Backup, flash whole display to hex color for 10s, then revert")
+    log_print("  test <seconds> <pixels>  - Send random <pixels> every <seconds>")
     log_print("  random                 - Toggle random overlay")
     log_print("  random on|off|status   - Control random overlay explicitly")
     log_print("  help                   - Show this help")
@@ -633,21 +671,20 @@ def console_listener():
             
             elif lower.startswith("test "):
                 parts = cmd.split()
-                if len(parts) == 3:
+                if len(parts) == 2:
+                    color_arg = parts[1]
+                    threading.Thread(target=run_test_color_mode, args=(color_arg,), daemon=True).start()
+                    log_print(f"Test color thread started for #{color_arg}.")
+                elif len(parts) == 3:
                     try:
                         sec = int(parts[1])
                         pix = int(parts[2])
-                        
-                        # Spawn the test as a separate, independent thread
-                        test_thread = threading.Thread(
-                            target=run_test_mode, 
-                            args=(sec, pix), 
-                            daemon=True
-                        )
-                        test_thread.start()
+                        threading.Thread(target=run_test_mode, args=(sec, pix), daemon=True).start()
                         log_print(f"Test thread started with interval {sec}s and {pix} pixels.")
                     except ValueError:
-                        log_print("Usage: test <seconds> <pixels>")
+                        log_print("Usage: test <interval_sec> <num_pixels>  OR  test <hexcolor>")
+                else:
+                    log_print("Usage: test <interval_sec> <num_pixels>  OR  test <hexcolor>")
 
             elif lower == "reset":
                 log_print("Resetting: activating preset, clearing display, restoring backup...")
