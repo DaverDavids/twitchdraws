@@ -1,0 +1,11 @@
+// Rename this file to config.json and edit with your actual values
+{
+  "wled_ip": "192.168.1.1",
+  "twitch_channel": "#your_channel",
+  "twitch_nick": "your_bot",
+  "twitch_oauth": "oauth:your_token",
+  "wled_preset_name": "bitmap",
+  "backup_interval_seconds": 300,
+  "web_server_port": 9370,
+  "enable_web_server": true
+}
