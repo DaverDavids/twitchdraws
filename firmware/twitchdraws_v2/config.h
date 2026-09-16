@@ -10,6 +10,11 @@ typedef struct {
     // WiFi
     char ssid[MAX_UNAME_LEN];
     char password[MAX_UNAME_LEN];
+    char hostname[MAX_UNAME_LEN];  // mDNS hostname, e.g. "twitchdraws" -> twitchdraws.local
+
+    // OTA (ArduinoOTA; low-priority task, only serviced during scroll mode)
+    bool ota_enabled;
+    char ota_password[MAX_UNAME_LEN];
 
     // Twitch
     char channel[MAX_UNAME_LEN];  // without '#'; normalized to '#<channel>' internally

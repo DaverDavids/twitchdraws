@@ -352,7 +352,7 @@ led_brightness=128           # FastLED global brightness, 0–255
 8. Fill display black, call `FastLED.show()` (blank on boot)
 9. Connect WiFi (blocking, 30s timeout; restart ESP32 via `ESP.restart()` on failure)
 10. Create `g_state_mutex = xSemaphoreCreateMutex()`
-11. Start tasks: `task_wifi_watch`, `task_twitch_rx`, `task_cmd_parser`, `task_display`
+11. Start tasks: `task_wifi_watch`, `task_twitch_rx`, `task_cmd_parser`, `task_display`, `task_ota` (OTA task added at user direction; see OTA Updates section)
 12. Main loop: feed WDT, print stats to Serial every 60s, sleep
 
 ---
@@ -396,7 +396,6 @@ Write a minimal sketch that lights a single known `(x, y)` coordinate and visual
 
 - **Custom chat commands:** Add handlers to a dispatch table in `task_cmd_parser`. Each handler receives `(username, message)`, executes its action (may write to `framebuf` directly or trigger a mode transition), then returns. The display task's Focus Mode mechanism is available to any handler.
 - **SD card storage:** If LittleFS partition fills, replace file I/O layer with SD/SPI — only file open/read/write calls change.
-- **OTA updates:** Add `ArduinoOTA` in a low-priority task; run only during scroll mode to avoid display glitches.
 - **Brightness control:** A chat command could call `FastLED.setBrightness()` live.
 - **Per-panel effects:** Future panel-level animations (wipe, flash) can be implemented in the display task as transient modes alongside SCROLL and FOCUS.
 
@@ -406,7 +405,7 @@ Write a minimal sketch that lights a single known `(x, y)` coordinate and visual
 
 - [ ] **`LED_DATA_PIN`:** GPIO pin for WS2812B data line — confirm with hardware wiring before first flash
 - [ ] **Panel chain order & serpentine:** Confirm physical LED index mapping with a test sketch (see Physical LED Index Mapping section)
-- [ ] **LittleFS partition size:** Set in Arduino IDE partition scheme or `partitions.csv`. Recommended: use "No OTA (2MB APP / 2MB SPIFFS)" scheme or equivalent to maximize storage. Document chosen scheme in code header.
+- [ ] **LittleFS partition size:** Set in Arduino IDE partition scheme or `partitions.csv`. OTA is now in the core build (see OTA Updates section), so the scheme must allow a 2nd app slot for ArduinoOTA. Recommended: **"Huge APP (3MB No OTA / 1MB SPIFFS)" is NOT sufficient** — pick a scheme with an OTA slot: Arduino IDE **"Minimal SPIFFS (1.9MB APP / 190KB SPIFFS / 1.9MB OTA)"** or PlatformIO `-D CONFIG_PARTITION_TABLE_CUSTOM` with `partitions.csv` (app0, app1, spiffs). Document chosen scheme in code header.
 - [ ] **OAuth token storage:** Plaintext in LittleFS — acceptable for single-owner device; noted here for awareness
 - [ ] **Scroll speed tuning:** Default of 6 cols/sec is a starting point; tune after running on hardware
 - [ ] **Max user scroll time:** With 100 users at 6 cols/sec, one full scroll cycle = 100 × (64 cols / 6) ≈ 17 minutes. Consider a configurable max-users-in-rotation cap if this grows too long.

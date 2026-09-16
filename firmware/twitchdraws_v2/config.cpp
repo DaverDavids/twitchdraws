@@ -63,6 +63,9 @@ static void set_defaults() {
     memset(&g_cfg, 0, sizeof(g_cfg));
     strcpy(g_cfg.ssid, "");
     strcpy(g_cfg.password, "");
+    strcpy(g_cfg.hostname, "twitchdraws"); // mDNS: twitchdraws.local
+    g_cfg.ota_enabled = true;
+    strcpy(g_cfg.ota_password, "");
     strcpy(g_cfg.channel, "");
     g_cfg.oauth_mode = false;
     strcpy(g_cfg.nick, "justinfan12345");
@@ -109,6 +112,12 @@ bool config_load(const char* path) {
             strncpy(g_cfg.oauth_token, value, sizeof(g_cfg.oauth_token) - 1);
         } else if (strcasecmp(key, "oauth_nick") == 0) {
             strncpy(g_cfg.oauth_nick, value, sizeof(g_cfg.oauth_nick) - 1);
+        } else if (strcasecmp(key, "hostname") == 0) {
+            strncpy(g_cfg.hostname, value, sizeof(g_cfg.hostname) - 1);
+        } else if (strcasecmp(key, "ota_enabled") == 0) {
+            g_cfg.ota_enabled = (strcasecmp(value, "true") == 0 || strcasecmp(value, "1") == 0 || strcasecmp(value, "yes") == 0);
+        } else if (strcasecmp(key, "ota_password") == 0) {
+            strncpy(g_cfg.ota_password, value, sizeof(g_cfg.ota_password) - 1);
         } else if (strcasecmp(key, "scroll_speed") == 0) {
             g_cfg.scroll_speed = parse_int_clamped(value, 6, 1, 60);
         } else if (strcasecmp(key, "led_brightness") == 0) {

@@ -21,6 +21,7 @@
 
 #include "config.h"
 #include "display.h"
+#include "ota.h"
 #include "parser.h"
 #include "state.h"
 #include "storage.h"
@@ -81,6 +82,9 @@ void setup() {
     Serial.println();
     Serial.printf("[boot] WiFi connected, IP=%s\n", WiFi.localIP().toString().c_str());
 
+    // 5b. mDNS hostname + OTA (scope.md OTA bullet, promoted from Future).
+    ota_init();
+
     // 6. IRC line queue + tasks (scope.md Startup 10-11, Task Architecture).
     twitch_create_queue();
 
@@ -92,6 +96,8 @@ void setup() {
                             PARSER_STACK, NULL, PARSER_PRIO, NULL, APP_CORE);
     xTaskCreatePinnedToCore(task_display, "display",
                             DISPLAY_STACK, NULL, DISPLAY_PRIO, NULL, APP_CORE);
+    xTaskCreatePinnedToCore(task_ota, "ota",
+                            OTA_STACK, NULL, OTA_PRIO, NULL, APP_CORE);
 
     Serial.println("[boot] tasks started");
 }

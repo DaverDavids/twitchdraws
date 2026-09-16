@@ -2,6 +2,13 @@
 ssid=YourWiFiSSID
 password=YourWiFiPassword
 
+# mDNS hostname (advertised as <hostname>.local; also used as OTA hostname)
+hostname=twitchdraws
+
+# OTA
+# ota_enabled=false   # uncomment to disable updates
+# ota_password=       # leave empty for ArduinoOTA default (Arduino IDE dialog)
+
 # Twitch
 channel=your_channel_name
 twitch_mode=anonymous
