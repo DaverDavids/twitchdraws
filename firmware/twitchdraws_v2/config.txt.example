@@ -1,0 +1,14 @@
+# WiFi
+ssid=YourWiFiSSID
+password=YourWiFiPassword
+
+# Twitch
+channel=your_channel_name
+twitch_mode=anonymous
+nick=justinfan12345
+# oauth=oauth:your_token
+# oauth_nick=your_bot_nick
+
+# Display
+scroll_speed=6
+led_brightness=128
