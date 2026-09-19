@@ -11,6 +11,7 @@
 #include "state.h"
 #include "storage.h"
 #include "twitch.h"
+#include "ntp.h"
 
 // Max coordinate pairs honored per single message (v1 piled up every pair).
 #define MAX_COORDS 128
@@ -196,8 +197,22 @@ static bool handle_pixel_command(const char* username, const char* message) {
         return false;
     }
 
-    // Touch last-interaction date. Date source (NTP) not implemented -> no-op.
-    storage_touch_date(username, "");
+    // Touch last-interaction date — now REAL via ntp.cpp's pure UTC -> ISO
+    // formatter (ntp.h/ntp.cpp, promoted from the storage.cpp seam; scope.md
+    // File Storage Layout bullets 2 + Known Constraints 03). UTC day is on
+    // purpose (ntp.h): the .date format is timezone-free; a viewer converts at
+    // render time, so a draw at 23:30 UTC keeps its intended day.
+    char iso[11];
+    if (ntp_today(iso)) {
+        storage_touch_date(username, iso);
+        Serial.printf("[parser] .date=%s touching username=%s\n", iso, username);
+    } else {
+        // RTC not synced yet this boot — defer (scope.md: only write .date
+        // when time is valid). Events still register; the .date back-fill can
+        // be re-stamped later (storage_touch_date is idempotent per day).
+        Serial.printf("[parser] .date deferred (RTC unsynced) username=%s\n",
+                      username);
+    }
 
     // Update userlist (remove existing, prepend, rewrite) and mirror into AppState.
     char newlist[MAX_USERS][MAX_UNAME_LEN];

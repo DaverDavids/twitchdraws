@@ -155,12 +155,21 @@ bool storage_userlist_touch(const char* username,
 }
 
 bool storage_touch_date(const char* username, const char* iso_date) {
+    if (iso_date == NULL || iso_date[0] == '\0') {
+        Serial.println("[storage] WARN: touch_date() called with empty iso_date (NTP not synced yet)");
+        return true;
+    }
+
     char path[64 + sizeof(DIR_META) + 4];
     date_path(username, path, sizeof(path));
-    // TODO(scope.md): NTP/time source not in scope yet. The .date files are not
-    // rendered on the LEDs today, so defer writes until time sync exists.
-    (void)path;
-    (void)iso_date;
+    File f = LittleFS.open(path, "w");
+    if (!f) {
+        Serial.printf("[storage] ERROR: cannot write %s\n", path);
+        return false;
+    }
+    f.print(iso_date);
+    f.close();
+    Serial.printf("[storage] date touched: %s -> %s\n", username, iso_date);
     return true;
 }
 

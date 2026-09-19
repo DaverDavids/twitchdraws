@@ -2,3 +2,7 @@ config.json
 log.txt
 matrix.ods
 ideas.txt
+# Runtime artifacts from the v1 Python server (not firmware source)
+error.log
+bitmaps/backup.json
+bitmaps/*.json

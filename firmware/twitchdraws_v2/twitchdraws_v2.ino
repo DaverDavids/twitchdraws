@@ -85,6 +85,13 @@ void setup() {
     // 5b. mDNS hostname + OTA (scope.md OTA bullet, promoted from Future).
     ota_init();
 
+    // 5c. NTP/RTC (scope.md Known Constraints item 03 "NTP/time" promoted to
+    // core). Seeds UTC time after WiFi; task_ntp feeds keepalive so .date
+    // writes below only ever stamp real interaction days.
+    ntp_init();
+    xTaskCreatePinnedToCore(task_ntp, "ntp",
+                            NTP_STACK, NULL, NTP_PRIO, NULL, APP_CORE);
+
     // 6. IRC line queue + tasks (scope.md Startup 10-11, Task Architecture).
     twitch_create_queue();
 
