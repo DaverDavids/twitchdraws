@@ -19,9 +19,8 @@
 //   task_ntp()         FreeRTOS task: keepalive, re-seeds cache, never blocks
 // ===========================================================================
 
-static bool   s_rtc_valid = falseskap;
+static bool   s_rtc_valid = false;
 static time_t s_last_valid_epoch = 0;
-
 static bool epoch_post_2000(time_t t) {
     // ESP32 boots into 1970. 2000-01-01T00:00:00Z == 946684800; anything
     // below that means configTime()/RTC hasn't advanced past boot-time.
