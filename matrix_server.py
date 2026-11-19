@@ -1,17 +1,31 @@
-import requests, json, sys, socket, threading, re, time, os, traceback, datetime, random
-from flask import Flask, render_template_string, redirect, request
+import requests, json, sys, socket, threading, re, time, os, traceback, random, queue
+from flask import Flask, render_template_string, redirect, request, jsonify
 
 CONFIG_FILE = "config.json"
 BITMAP_DIR = "bitmaps"
 BITMAP_FILE = os.path.join(BITMAP_DIR, "backup.json")
 WIDTH, HEIGHT = 64, 16
 PIXEL_COUNT = WIDTH * HEIGHT
+
+IRC_HOST = os.environ.get("TWITCH_IRC_HOST", "irc.chat.twitch.tv")
+IRC_PORT = int(os.environ.get("TWITCH_IRC_PORT", "6667"))
+IRC_RECV_TIMEOUT = 2.0
+IRC_PING_INTERVAL = 90
+IRC_PONG_TIMEOUT = 60
+IRC_READ_TIMEOUT = 300
+IRC_STALL_THRESHOLD = 420
+IRC_JOIN_TIMEOUT = 20
+IRC_BUFFER_MAX = 65536
+IRC_RECONNECT_MIN = 1
+IRC_RECONNECT_MAX = 60
+WLED_QUEUE_MAX = 500
 # Randomizer settings (change these at top of the script)
 RANDOMIZE_INTERVAL_SECONDS = 3600    # default: 1 hour
 RANDOMIZE_PERCENT = 0                # default changed to 1% of pixels
 verbose = "--verbose" in sys.argv
 shutdown_event = threading.Event()
 _last_backup_hash = None
+_last_eof_log = 0.0
 
 ERROR_LOG = "error.log"
 
@@ -45,6 +59,18 @@ last_twitch_time = None
 last_twitch_username = None
 last_pixel_command = None
 last_http_request = None  # dict with url, payload (truncated), timestamp
+
+twitch_status_lock = threading.Lock()
+twitch_status = {
+    "connected": False,
+    "joined": False,
+    "last_data_time": None,
+    "last_message_time": None,
+    "reconnects": 0,
+    "last_error": None,
+}
+twitch_socket = None
+pixel_queue = queue.Queue(maxsize=WLED_QUEUE_MAX)
 
 # Randomizer enabled flag and lock (CLI/web toggle will change this)
 randomizer_enabled = True
@@ -525,6 +551,41 @@ def clear_board():
         log_error("Failed to clear board", exc=e)
         log_print(f"Failed to clear board: {e}")
 
+def enqueue_pixel_payload(payload, updates):
+    """Queue a WLED update without blocking the IRC reader on HTTP."""
+    try:
+        pixel_queue.put_nowait((payload, updates))
+        return
+    except queue.Full:
+        pass
+    try:
+        pixel_queue.get_nowait()
+        pixel_queue.task_done()
+    except queue.Empty:
+        pass
+    try:
+        pixel_queue.put_nowait((payload, updates))
+    except queue.Full:
+        log_error("Pixel queue full — dropping update", extra={"num_pixels": len(updates)})
+
+
+def wled_sender():
+    """Apply queued pixel updates to WLED; HTTP latency stays off the chat path."""
+    while not shutdown_event.is_set():
+        try:
+            payload, updates = pixel_queue.get(timeout=1)
+        except queue.Empty:
+            continue
+        try:
+            safe_post(f"{BASE_URL}/json/state", json_payload=payload)
+            for index, color in updates:
+                bitmap[index] = color
+        except Exception:
+            pass  # safe_post already logged the failure with full context
+        finally:
+            pixel_queue.task_done()
+
+
 def parse_pixel_command(message):
     global last_pixel_command
     msg = message.strip()
@@ -555,13 +616,14 @@ def parse_pixel_command(message):
 
         # Build a batch payload for all valid pixels
         pixel_data = []
+        updates = []
         queued_pixels = []
         for x_str, y_str in coords:
             x, y = int(x_str), int(y_str)
             if 1 <= x <= WIDTH and 1 <= y <= HEIGHT:
                 index = xy_to_index(x, y)
                 pixel_data.extend([index, hex_color])
-                bitmap[index] = hex_color  # Update internal bitmap
+                updates.append((index, hex_color))
                 queued_pixels.append(f"({x},{y})")
             else:
                 if verbose:
@@ -572,18 +634,13 @@ def parse_pixel_command(message):
             # Color info at the beginning as requested
             log_print(f"Color #{hex_color} - Queued {len(queued_pixels)} pixels: {', '.join(queued_pixels)}")
 
-        # Send all pixels in one request
+        # Hand off to the WLED worker; bitmap is updated only after a successful POST
         if pixel_data:
             payload = {"seg": [{"i": pixel_data}]}
-            # record in diagnostics
             _record_http_request(f"{BASE_URL}/json/state", payload)
-            try:
-                safe_post(f"{BASE_URL}/json/state", json_payload=payload)
-                if verbose:
-                    log_print(f"Sent {len(pixel_data)//2} pixels in one batch request")
-            except Exception as e:
-                # safe_post logged the error
-                log_print(f"Failed to update pixels: {e}")
+            enqueue_pixel_payload(payload, updates)
+            if verbose:
+                log_print(f"Queued {len(updates)} pixels for one batch request")
     except Exception as e:
         log_error("Exception while parsing pixel command", exc=e, extra={"message": message})
         if verbose:
@@ -620,8 +677,12 @@ def console_listener():
             try:
                 cmd = input().strip()
             except EOFError as e:
-                # stdin closed (e.g., running as service); log and sleep, keep thread alive
-                log_error("Console listener EOF (stdin closed), continuing and retrying", exc=e)
+                # stdin closed (e.g., running as service); keep the thread alive
+                # but don't fill error.log with one entry every five seconds
+                global _last_eof_log
+                if time.time() - _last_eof_log > 60:
+                    log_error("Console listener EOF (stdin closed), continuing and retrying", exc=e)
+                    _last_eof_log = time.time()
                 time.sleep(5)
                 continue
 
@@ -746,103 +807,182 @@ def console_listener():
         except Exception as e:
             log_error("Console listener error", exc=e)
 
+def parse_privmsg(line):
+    """Return (username, channel, message) for an IRC PRIVMSG line, else None."""
+    if " PRIVMSG " not in line:
+        return None
+    if line.startswith("@"):
+        line = line.split(" ", 1)[1] if " " in line else ""
+    match = re.match(r"^:([^!\s]+)(?:![^\s]*)?\s+PRIVMSG\s+(\S+)\s*:(.*)$", line)
+    if not match:
+        return None
+    return match.group(1), match.group(2), match.group(3)
+
+
+def _irc_send(sock, command):
+    sock.sendall((command + "\r\n").encode("utf-8"))
+
+
+def _set_twitch_status(**updates):
+    with twitch_status_lock:
+        twitch_status.update(updates)
+
+
 def twitch_listener():
     """
-    This version will reconnect on socket closure/exception. It will:
-      - loop forever while not shutdown_event
-      - try to connect and authenticate
-      - read data, handle PRIVMSG
-      - if the socket closes or any error occurs, close socket and retry after backoff
-    """
-    global last_twitch_line, last_twitch_time, last_twitch_username
+    Maintain a Twitch IRC connection and dispatch chat messages.
 
-    backoff = 1
+    Reconnects on socket errors, clean closes, failed JOINs and — crucially —
+    on silent connections that stop delivering data. A dead TCP socket can
+    stay "ESTABLISHED" while recv() only ever times out, so we send our own
+    PINGs and enforce both PONG and general read-inactivity deadlines.
+    """
+    global last_twitch_line, last_twitch_time, last_twitch_username, twitch_socket
+
+    backoff = IRC_RECONNECT_MIN
     while not shutdown_event.is_set():
         sock = None
         try:
-            sock = socket.socket()
-            sock.settimeout(10.0)
-            sock.connect(("irc.chat.twitch.tv", 6667))
-            sock.settimeout(2.0)  # read timeout
+            sock = socket.create_connection((IRC_HOST, IRC_PORT), timeout=10)
+            sock.settimeout(IRC_RECV_TIMEOUT)
+            with twitch_status_lock:
+                twitch_socket = sock
+                twitch_status.update({
+                    "connected": True,
+                    "joined": False,
+                    "last_data_time": time.time(),
+                    "last_error": None,
+                })
+
             try:
-                sock.send(f"PASS {config['twitch_oauth']}\r\n".encode("utf-8"))
-                sock.send(f"NICK {config['twitch_nick']}\r\n".encode("utf-8"))
-                sock.send(f"JOIN {config['twitch_channel']}\r\n".encode("utf-8"))
+                _irc_send(sock, f"PASS {config['twitch_oauth']}")
+                _irc_send(sock, f"NICK {config['twitch_nick']}")
+                _irc_send(sock, f"JOIN {config['twitch_channel']}")
             except Exception as e:
                 log_error("Failed to send initial Twitch IRC auth/join", exc=e)
                 raise
 
-            if verbose:
-                log_print(f"Connected to Twitch chat at {config['twitch_channel']}")
-
             buffer = ""
-            # reset backoff after a successful connection
-            backoff = 1
+            joined = False
+            join_deadline = time.time() + IRC_JOIN_TIMEOUT
+            last_data = time.time()
+            last_ping_sent = 0.0
+            awaiting_pong = False
+            pong_deadline = 0.0
 
             while not shutdown_event.is_set():
-                try:
-                    resp = sock.recv(4096).decode("utf-8", errors="replace")
-                    if resp == "":
-                        # socket closed, attempt reconnect
-                        log_error("Empty response from Twitch IRC socket (socket closed) — will reconnect")
+                now = time.time()
+
+                if joined and now - last_ping_sent >= IRC_PING_INTERVAL:
+                    try:
+                        _irc_send(sock, "PING :tmi.twitch.tv")
+                        last_ping_sent = now
+                        awaiting_pong = True
+                        pong_deadline = now + IRC_PONG_TIMEOUT
+                    except Exception as e:
+                        log_error("Failed to send IRC heartbeat", exc=e)
                         break
 
-                    buffer += resp
-                    # update last_twitch_time on any data
-                    last_twitch_time = time.time()
-                    # split into lines
-                    lines = buffer.split("\r\n")
-                    buffer = lines.pop()  # leftover partial line
-                    for line in lines:
-                        last_twitch_line = line
-                        if line.startswith("PING"):
-                            try:
-                                sock.send("PONG :tmi.twitch.tv\r\n".encode("utf-8"))
-                            except Exception as e:
-                                log_error("Failed to respond to PING", exc=e, extra={"line": line})
-                        else:
-                            if "PRIVMSG" in line:
-                                parts = line.split(":", 2)
-                                if len(parts) == 3:
-                                    prefix = parts[1].strip()
-                                    # Extract username from prefix like "username!username@host"
-                                    username = prefix.split("!", 1)[0] if "!" in prefix else prefix
-                                    last_twitch_username = username
-                                    user_msg = parts[2]
-                                    # Always print username and the chat message (timestamped by log_print)
-                                    log_print(f"{username}: {user_msg}")
-                                    # update last_twitch_time for PRIVMSG specifically
-                                    last_twitch_time = time.time()
-                                    try:
-                                        parse_pixel_command(user_msg)
-                                    except Exception as e:
-                                        log_error("parse_pixel_command raised", exc=e, extra={"user_msg": user_msg, "username": username})
-                except socket.timeout:
-                    # normal keepalive behavior
-                    continue
-                except Exception as e:
-                    log_error("Twitch listener inner read error", exc=e)
-                    # break to outer loop to reconnect
+                if awaiting_pong and now > pong_deadline:
+                    log_error("Twitch IRC heartbeat timed out — reconnecting")
                     break
+                if now - last_data > IRC_READ_TIMEOUT:
+                    log_error(f"No Twitch IRC data for {IRC_READ_TIMEOUT}s — reconnecting")
+                    break
+                if not joined and now > join_deadline:
+                    log_error("Twitch IRC JOIN was not confirmed — reconnecting")
+                    break
+
+                try:
+                    resp = sock.recv(4096)
+                except socket.timeout:
+                    continue
+
+                if not resp:
+                    log_error("Empty response from Twitch IRC socket (socket closed) — will reconnect")
+                    break
+
+                last_data = time.time()
+                last_twitch_time = last_data
+                _set_twitch_status(last_data_time=last_data)
+                buffer += resp.decode("utf-8", errors="replace")
+                if len(buffer) > IRC_BUFFER_MAX:
+                    buffer = buffer[-IRC_BUFFER_MAX:]
+                lines = buffer.split("\r\n")
+                buffer = lines.pop()
+
+                for line in lines:
+                    last_twitch_line = line
+
+                    if line.startswith("PING"):
+                        try:
+                            _irc_send(sock, "PONG :tmi.twitch.tv")
+                        except Exception as e:
+                            log_error("Failed to respond to PING", exc=e, extra={"line": line})
+                            raise
+                        continue
+
+                    if line.startswith("PONG"):
+                        awaiting_pong = False
+                        continue
+
+                    join_line = (
+                        " 353 " in line or " 366 " in line
+                        or (f"JOIN {config['twitch_channel']}" in line
+                            and config["twitch_nick"].lower() in line.lower())
+                    )
+                    if join_line and not joined:
+                        joined = True
+                        backoff = IRC_RECONNECT_MIN
+                        _set_twitch_status(joined=True)
+                        last_ping_sent = time.time()
+                        log_print(f"Connected to Twitch chat at {config['twitch_channel']}")
+
+                    if "NOTICE" in line:
+                        log_print(f"Twitch NOTICE: {line}")
+
+                    parsed = parse_privmsg(line)
+                    if parsed:
+                        username, channel, user_msg = parsed
+                        last_twitch_username = username
+                        last_twitch_time = time.time()
+                        with twitch_status_lock:
+                            twitch_status["last_message_time"] = last_twitch_time
+                        log_print(f"{username}: {user_msg}")
+                        try:
+                            parse_pixel_command(user_msg)
+                        except Exception as e:
+                            log_error("parse_pixel_command raised", exc=e,
+                                      extra={"user_msg": user_msg, "username": username})
 
         except Exception as e:
             log_error("Twitch listener connection/setup error", exc=e)
+            _set_twitch_status(last_error=str(e))
         finally:
-            try:
-                if sock:
+            if sock:
+                try:
                     sock.close()
-            except Exception:
-                pass
+                except Exception:
+                    pass
+            with twitch_status_lock:
+                twitch_socket = None
+                twitch_status["connected"] = False
+                twitch_status["joined"] = False
 
-        # if we reach here we will attempt to reconnect unless shutdown_event set
         if shutdown_event.is_set():
             break
 
-        # exponential backoff with cap
-        sleep_time = min(backoff, 60)
-        log_error(f"Twitch listener disconnected — will retry in {sleep_time}s", extra={"backoff": backoff})
-        time.sleep(sleep_time)
-        backoff = min(backoff * 2, 60)
+        with twitch_status_lock:
+            twitch_status["reconnects"] += 1
+        sleep_time = min(backoff, IRC_RECONNECT_MAX)
+        sleep_time += random.uniform(0, sleep_time * 0.25)
+        log_error(f"Twitch listener disconnected — will retry in {sleep_time:.1f}s",
+                  extra={"backoff": backoff})
+        deadline = time.time() + sleep_time
+        while time.time() < deadline and not shutdown_event.is_set():
+            time.sleep(0.5)
+        backoff = min(backoff * 2, IRC_RECONNECT_MAX)
+
 
 # ---------------------
 # Randomizer thread
@@ -931,8 +1071,8 @@ def randomize_pixels_periodically():
 # ---------------------
 def watchdog():
     """
-    Periodically check the registered threads in thread_factories.
-    If any registered thread is not alive, attempt to restart it and log the restart.
+    Restart dead threads and force-close a Twitch socket that is alive but
+    silent, so the listener cannot sit forever in a recv() timeout loop.
     """
     while not shutdown_event.is_set():
         try:
@@ -948,6 +1088,23 @@ def watchdog():
                         log_error("Thread restarted", extra={"thread_name": name})
                     except Exception as e:
                         log_error("Failed restarting thread", exc=e, extra={"thread_name": name})
+                    continue
+
+                if name == "twitch_listener":
+                    with twitch_status_lock:
+                        last_data = twitch_status.get("last_data_time")
+                    if last_data and time.time() - last_data > IRC_STALL_THRESHOLD:
+                        log_error("Twitch listener stalled — forcing socket close")
+                        stuck = twitch_socket
+                        if stuck:
+                            try:
+                                stuck.shutdown(socket.SHUT_RDWR)
+                            except Exception:
+                                pass
+                            try:
+                                stuck.close()
+                            except Exception:
+                                pass
         except Exception as e:
             log_error("Watchdog error", exc=e)
 
@@ -1022,6 +1179,7 @@ HTML_TEMPLATE = """
       </form>
 
       <div class="status">Random overlay: {% if randomizer_enabled %}ENABLED{% else %}DISABLED{% endif %}</div>
+      <div class="status"><a href="/status">Status</a></div>
     </div>
 
     <div class="grid-container">
@@ -1060,6 +1218,17 @@ def toggle_random_route():
     log_print(f"Random overlay toggled via web → {state}")
     return redirect("/")
 
+@app.route("/status")
+def status_route():
+    with twitch_status_lock:
+        status = dict(twitch_status)
+    for key in ("last_data_time", "last_message_time"):
+        value = status.get(key)
+        status[key] = datetime.fromtimestamp(value).isoformat() if value else None
+    status["queue_size"] = pixel_queue.qsize()
+    status["channel"] = config.get("twitch_channel")
+    return jsonify(status)
+
 # -------------------------
 # Main startup
 # -------------------------
@@ -1088,6 +1257,7 @@ if __name__ == "__main__":
     try:
         register_thread("console_listener", console_listener)
         register_thread("twitch_listener", twitch_listener)
+        register_thread("wled_sender", wled_sender)
         register_thread("save_bitmap_periodically", save_bitmap_periodically)
         register_thread("watchdog", watchdog)
         register_thread("randomize_pixels_periodically", randomize_pixels_periodically)
